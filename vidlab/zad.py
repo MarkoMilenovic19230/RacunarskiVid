@@ -1,0 +1,196 @@
+import cv2
+import numpy as np
+
+
+def detect_and_match_features(img1, img2):
+    # SIFT najbolje radi na crno-belim slikama (brže je i intenzitet svetla je bitniji od boje)
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
+    # Inicijalizujemo SIFT (on traži karakteristične tačke poput ćoškova, ivica, mrlja)
+    sift = cv2.SIFT_create()
+    
+    # kp (keypoints) su koordinate tačaka, des (descriptors) su opisi tih tačaka (njihov "otisak prsta")
+    kp1, des1 = sift.detectAndCompute(gray1, None)
+    kp2, des2 = sift.detectAndCompute(gray2, None)
+
+    # BFMatcher (Brute Force) bukvalno poredi svaki deskriptor sa prve slike sa svakim sa druge
+    bf = cv2.BFMatcher()
+    
+    # k=2 znači da za svaku tačku tražimo dva najbolja pogotka (da bismo ih posle uporedili)
+    matches = bf.knnMatch(des1, des2, k=2)
+
+    # Filtriranje loših pogodaka (Lowe's ratio test)
+    good = []
+    for m, n in matches:
+        # Ako je najbolji pogodak (m) značajno bolji od drugog najboljeg (n), to je "dobra" tačka
+        if m.distance < 0.7 * n.distance:
+            good.append(m)
+
+    return kp1, kp2, good
+
+
+def warp_two_images(img_base, img_to_warp):
+    """
+    Funkcija koja spaja dve slike (img_base miruje, img_to_warp se transformiše).
+    """
+
+    # 1. Pozivamo funkciju za detekciju ključnih tačaka i njihovo uparivanje.
+    # Dobijamo: kp_base (tačke na prvoj), kp_warp (tačke na drugoj) i good_matches (parove).
+    kp_base, kp_warp, good_matches = detect_and_match_features(img_base, img_to_warp)
+
+    # 2. Proveravamo da li imamo bar 4 para tačaka. 
+    # Matematički, Homografija (3x3 matrica) ima 8 nepoznatih varijabli.
+    # Pošto svaki par tačaka daje 2 jednačine (x i y), 4 para su minimum (4x2=8) da se sistem reši.
+    if len(good_matches) < 4:
+        print("Nema dovoljno mečeva za homografiju.")
+        return None
+
+    # 3. Izdvajamo (x,y) koordinate uparenih tačaka iz ključnih tačaka obe slike.
+    # .reshape(-1, 1, 2) pravi kolonu od parova koordinata, što OpenCV traži kao ulazni format.
+    pts_base = np.float32([kp_base[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    pts_warp = np.float32([kp_warp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # 4. Računamo matricu Homografije (H). H nam govori kako da preslikamo piksele druge slike u prvu.
+    # RANSAC je robustan algoritam koji tokom računanja detektuje i izbacuje pogrešno uparene tačke.
+    # 5.0 je prag tolerancije: ako tačka odstupa više od 5 piksela, smatra se greškom.
+    H, status = cv2.findHomography(pts_warp, pts_base, cv2.RANSAC, 5.0)
+
+    # 5. Uzimamo visinu (h) i širinu (w) obe slike pomoću .shape (prva dva elementa matrice).
+    h1, w1 = img_base.shape[:2]
+    h2, w2 = img_to_warp.shape[:2]
+
+    # 6. Definišemo koordinate četiri ugla druge slike: gornji-levi, donji-levi, donji-desni i gornji-desni.
+    pts_corners_warp = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
+    
+    # 7. perspectiveTransform: Koristi matricu H da izračuna gde će ovi uglovi završiti na novoj panorami.
+    # Rezultat su nove koordinate uglova. Ako slika ide levo, koordinate mogu biti i negativne.
+    pts_corners_warp_trans = cv2.perspectiveTransform(pts_corners_warp, H)
+
+    # 8. Definišemo uglove bazne slike (koja se ne transformiše, pa su joj uglovi fiksni).
+    pts_corners_base = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+
+    # 9. Spajamo (konkateniramo) sve uglove (4 od baze i 4 transformisana) u jednu listu od 8 tačaka.
+    all_pts = np.concatenate((pts_corners_base, pts_corners_warp_trans), axis=0)
+
+    # 10. Tražimo minimalne i maksimalne koordinate (x i y) među svih 8 uglova.
+    # Ovo nam definiše spoljne ivice (granice) celokupne buduće panorame.
+    # .ravel() pretvara niz u jednu liniju, a -0.5 i +0.5 služe za precizno zaokruživanje na ceo piksel.
+    [x_min, y_min] = np.int32(all_pts.min(axis=0).ravel() - 0.5)
+    [x_max, y_max] = np.int32(all_pts.max(axis=0).ravel() + 0.5)
+
+    # 11. translation_dist računa koliko treba pomeriti sliku. 
+    # Ako je x_min npr. -200, moramo sve da pomerimo za +200 piksela da slika ne bi bila odsečena.
+    translation_dist = [-x_min, -y_min]
+
+    # 12. Pravimo matricu translacije (H_translation). Ona služi samo da "gurne" sliku udesno i nadole.
+    # Izgleda ovako: [[1, 0, tx], [0, 1, ty], [0, 0, 1]] gde su tx i ty vrednosti pomeranja.
+    H_translation = np.array([[1, 0, translation_dist[0]],
+                              [0, 1, translation_dist[1]],
+                              [0, 0, 1]], dtype=np.float32)
+
+    # 13. Računamo finalne dimenzije novog platna kao razliku između maksimuma i minimuma.
+    final_w = x_max - x_min
+    final_h = y_max - y_min
+
+    # 14. warpPerspective: Fizički krivi i pomera drugu sliku.
+    # H_translation.dot(H) množi matrice: prvo se vrši Homografija (krivljenje), pa Translacija (pomeranje).
+    output_img = cv2.warpPerspective(img_to_warp, H_translation.dot(H), (final_w, final_h))
+
+    # 15. Baznu sliku (koja miruje) sada samo pomeramo (transliramo) na to isto novo, veliko platno.
+    base_transformed = cv2.warpPerspective(img_base, H_translation, (final_w, final_h))
+
+    # 16. Spajanje (Blending/Overlay):
+    # mask pronalazi sve piksele gde se nalazi bazna slika (tamo gde vrednost piksela nije nula).
+    # Zatim te piksele bazne slike "nalepi" preko već iscrtane transformisane slike.
+    mask = (base_transformed > 0)
+    output_img[mask] = base_transformed[mask]
+
+    # 17. Vraćamo gotov NumPy niz koji predstavlja spojen rezultat dve slike.
+    return output_img
+
+
+# --- GLAVNI IZVRŠNI PROGRAM ---
+
+# 1. Učitavanje ulaznih fotografija sa hard diska:
+# - cv2.imread: Funkcija koja čita sliku i pretvara je u NumPy matricu (niz brojeva).
+# - Svaka slika se učitava u BGR formatu (Plava, Zelena, Crvena).
+img1 = cv2.imread('1.JPG')  # Leva fotografija u nizu.
+img2 = cv2.imread('2.JPG')  # Srednja fotografija - služi kao centralno "sidro" (referentna tačka).
+img3 = cv2.imread('3.JPG')  # Desna fotografija u nizu.
+
+# 2. Bezbednosna provera (Validacija):
+# - Ako putanja do slike nije dobra ili fajl ne postoji, cv2.imread vraća 'None'.
+# - Ova provera sprečava da program "pukne" (crash) pri pokušaju obrade nepostojećih podataka.
+if img1 is None or img2 is None or img3 is None:
+    print("Greška: Neke slike nisu pronađene. Proveri putanje i imena fajlova.")
+else:
+    print("Spajanje slike 2 i 3...")
+    
+    # 3. PRVI KORAK SPAJANJA (Srednja + Desna):
+    # - Pozivamo funkciju warp_two_images. 
+    # - img2 (Srednja) je 'base' (ona miruje).
+    # - img3 (Desna) je 'warp' (ona se krivi da bi legla na desnu stranu srednje slike).
+    # - Rezultat 'panorama_right' je nova, proširena matrica koja sadrži obe ove slike.
+    panorama_right = warp_two_images(img2, img3)
+
+    # Proveravamo da li je prvi korak uspeo (da li je bilo dovoljno zajedničkih tačaka).
+    if panorama_right is not None:
+        print("Spajanje rezultata sa slikom 1...")
+        
+        # 4. DRUGI KORAK SPAJANJA ((Srednja+Desna) + Leva):
+        # - Sada 'panorama_right' (već spojene dve slike) postaje 'base' (referenca).
+        # - img1 (Leva) postaje 'warp' (ona se krivi da bi legla na levu stranu).
+        # - Ovakvim inkrementalnim (postepenim) spajanjem dobijamo finalni spoj sve tri slike.
+        final_panorama = warp_two_images(panorama_right, img1)
+
+        # Proveravamo da li je i finalno spajanje uspelo.
+        if final_panorama is not None:
+            
+            # --- POST-PROCESIRANJE: ISECANJE (CROP) CRNIH IVICA ---
+            # Pošto homografija krivi slike, finalni rezultat nije savršen pravougaonik, 
+            # već ima nepravilne crne "zubace" (praznine) po ivicama.
+
+            # 5. Konverzija u sivu skalu radi segmentacije:
+            # - Potrebno nam je da razlikujemo sadržaj slike od crne pozadine.
+            gray = cv2.cvtColor(final_panorama, cv2.COLOR_BGR2GRAY)
+            
+            # 6. Prag binarizacije (Thresholding):
+            # - cv2.threshold: Sve piksele koji su svetliji od '1' (skoro crna) pretvara u '255' (čisto bela).
+            # - 'cv2.THRESH_BINARY': Pravi masku gde je panorama BELA, a prazan prostor CRN.
+            _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+            
+            # 7. Pronalaženje kontura (Find Contours):
+            # - cv2.findContours: Analizira belu masku i traži spoljne ivice (granice) panorame.
+            # - 'cv2.RETR_EXTERNAL': Uzima samo spoljnu konturu (ne zanima nas unutrašnjost).
+            # - 'cv2.CHAIN_APPROX_SIMPLE': Štedi memoriju tako što pamti samo ključne tačke ivice.
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # 8. Računanje opisnog pravougaonika (Bounding Box):
+                # - cv2.boundingRect: Uzima najdalje tačke konture i računa koordinate (x, y) 
+                #   i dimenzije (w - širina, h - visina) najmanjeg uspravnog pravougaonika koji ih obuhvata.
+                x, y, w, h = cv2.boundingRect(contours[0])
+                
+                # 9. Isecanje slike (Cropping):
+                # - Koristimo NumPy "slicing" da iz finalne panorame izvučemo samo taj pravougaonik.
+                # - [redovi, kolone] -> [y : y+visina, x : x+širina].
+                final_panorama = final_panorama[y:y + h, x:x + w]
+
+            # 10. Prikaz i čuvanje rezultata:
+            # - cv2.imshow: Otvara prozor na ekranu sa finalnim rezultatom.
+            # - cv2.imwrite: Čuva gotovu panoramu kao JPG fajl na hard disku.
+            cv2.imshow('Finalna Panorama', final_panorama)
+            cv2.imwrite('panorama_final.jpg', final_panorama)
+            
+            print("Gotovo! Slika sačuvana kao 'panorama_final.jpg'")
+            
+            # 11. Čišćenje i kraj:
+            # - cv2.waitKey(0): Zaustavlja izvršavanje koda i drži prozor otvorenim dok korisnik ne klikne bilo koji taster.
+            # - cv2.destroyAllWindows(): Zatvara sve GUI prozore i oslobađa sistemsku memoriju (RAM).
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        else:
+            print("Neuspešno spajanje leve slike.")
+    else:
+        print("Neuspešno spajanje desne slike.")
